@@ -9,7 +9,7 @@ Primary command is `predict` for direct use:
 Batch pipeline (TASK.md) is preserved via `classify | filter`:
   cat candidates.jsonl | laya-cli classify --questions q.json | laya-cli filter --where "on_topic>=0.4" --sort -on_topic
 
-Also: `questions`/`presets`, `evaluate`, `filter`, `info`.
+Also: `questions`/`presets`, `evaluate`, `filter`, `info`, `serve` (resident daemon).
 """
 
 from __future__ import annotations
@@ -18,11 +18,32 @@ import argparse
 import json
 import os
 import re as _re
+import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from . import __version__
+
+# Daemon helpers (import lazily to avoid circular, but keep top-level for type)
+try:
+    from .daemon import (
+        CACHE_DIR,
+        daemon_file_for,
+        daemon_port_for_args,
+        daemon_predict_via_http,
+        is_daemon_alive,
+        run_server,
+    )
+except ImportError:
+    # fallback if daemon module missing (should not happen)
+    CACHE_DIR = None
+    daemon_file_for = None  # type: ignore
+    daemon_port_for_args = None  # type: ignore
+    daemon_predict_via_http = None  # type: ignore
+    is_daemon_alive = None  # type: ignore
+    run_server = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Parser
@@ -160,6 +181,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="For batch: prepend field to state text as '<value> <state>'. Disabled by default (mixing metadata degraded on_topic scores 0.1-0.3).",
     )
     pr.add_argument("--output", default=None, help="Output file (default: stdout)")
+    pr.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Force in-process load, ignore resident daemon even if live (for reproducibility/debug).",
+    )
 
     # ---- classify (legacy batch, kept for TASK.md compat) -----------------
     c = sub.add_parser(
@@ -196,6 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("--lang", default=None, help="Force language for Router")
     c.add_argument("--prepend-field", default=None, help="Optional field to prepend to state text")
     c.add_argument("--full-probs", action="store_true", help="Include full distribution ({id}_probs)")
+    c.add_argument("--no-daemon", action="store_true", help="Force in-process load, ignore daemon")
 
     # ---- filter -----------------------------------------------------------
     f = sub.add_parser(
@@ -281,6 +308,49 @@ def _build_parser() -> argparse.ArgumentParser:
     e.add_argument("--router", action="store_true", help="Use laya.Router(preload=True)")
     e.add_argument("--lang", default=None, help="Force language for Router")
     e.add_argument("--prepend-field", default=None, help="Optional field to prepend to state text")
+    e.add_argument("--no-daemon", action="store_true", help="Force in-process load, ignore daemon")
+
+    # ---- serve (resident daemon) ------------------------------------------
+    s = sub.add_parser(
+        "serve",
+        help="Resident daemon that keeps model in memory (optional, speeds up repeated predict).",
+        description="Start a resident daemon that holds the Laya model in RAM. Subsequent predict/classify/evaluate automatically use it if live (same model/device/router). No change to pipelines if daemon not running.",
+        epilog=(
+            "Examples:\n"
+            "  laya-cli serve --model convaiinnovations/laya --device mps  # start daemon (background)\n"
+            "  laya-cli serve --foreground --idle-timeout 60                # foreground, for debugging\n"
+            "  laya-cli serve status                                        # show live daemon\n"
+            "  laya-cli serve status --model convaiinnovations/laya --subfolder multilingual\n"
+            "  laya-cli serve stop                                          # graceful shutdown\n"
+            "  laya-cli serve stop --all                                    # stop all daemons\n"
+            '  laya-cli predict "hello" --preset guard --no-daemon       # force in-process, ignore daemon\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # serve can be started with no subcommand, or with status/stop
+    s.add_argument("--model", default="convaiinnovations/laya", help="HF repo id (default: convaiinnovations/laya)")
+    s.add_argument("--subfolder", default=None, help="Subfolder: multilingual / typed-decisions / ''")
+    s.add_argument("--device", default=None, choices=["cpu", "mps", "cuda"], help="Device to force")
+    s.add_argument("--router", action="store_true", help="Use laya.Router(preload=True)")
+    s.add_argument("--lang", default=None, help="Force language for Router")
+    s.add_argument("--port", type=int, default=0, help="Port to bind (0 = random free, default 0)")
+    s.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=1800,
+        help="Idle seconds before daemon auto-exits (0 = disabled, default 1800)",
+    )
+    s.add_argument("--foreground", action="store_true", help="Run in foreground, don't daemonize (for logging/debug)")
+    # To support `serve status` / `serve stop` as subcommands, we add optional positional
+    s.add_argument(
+        "action",
+        nargs="?",
+        choices=["status", "stop"],
+        help="Action: status (show) or stop (shutdown). No action = start daemon.",
+    )
+    s.add_argument(
+        "--all", dest="all_daemons", action="store_true", help="For stop: stop all daemons regardless of config"
+    )
 
     # ---- info -------------------------------------------------------------
     inf = sub.add_parser(
@@ -675,7 +745,19 @@ def _print_table_single(result: dict[str, Any], fh) -> None:
 def cmd_predict(args: argparse.Namespace) -> None:
     questions = _load_questions_merged(args)
     args._warmup_questions = questions
-    agent = _init_agent(args)
+
+    # Try daemon first (unless --no-daemon)
+    daemon_port = None
+    agent = None
+    if not getattr(args, "no_daemon", False) and daemon_port_for_args is not None:
+        try:
+            daemon_port = daemon_port_for_args(args)  # type: ignore
+        except Exception:
+            daemon_port = None
+    if daemon_port:
+        print(f"[laya-cli] using daemon 127.0.0.1:{daemon_port} (no 10-35s load)", file=sys.stderr)
+    else:
+        agent = _init_agent(args)
 
     states = _collect_states_predict(args)
     if not states:
@@ -693,38 +775,60 @@ def cmd_predict(args: argparse.Namespace) -> None:
     results: list[dict[str, Any]] = []
     for orig, state in states:
         # state can be str/dict/list — pass as-is to Laya
-        try:
-            if getattr(args, "shortlist_k", None) is not None:
-                # shortlist path
-                try:
-                    from laya import embed_fn_from_agent, predict_shortlist
-                except ImportError as exc:
-                    print(f"error: shortlist requires laya shortlist module: {exc}", file=sys.stderr)
-                    sys.exit(2)
-                embed_fn = embed_fn_from_agent(agent)
-                k = int(args.shortlist_k)
-                # predict_shortlist expects agent, state, questions, embed_fn, k
-                if getattr(args, "router", False):
-                    kwargs = {}
-                    if getattr(args, "lang", None):
-                        kwargs["lang"] = args.lang
-                    result = predict_shortlist(agent, state, questions, embed_fn, k=k, **kwargs)
+        result: dict[str, Any] | None = None
+        # Try daemon first if available
+        if daemon_port is not None and daemon_predict_via_http is not None:  # type: ignore
+            try:
+                result = daemon_predict_via_http(  # type: ignore
+                    daemon_port,
+                    state,
+                    questions,
+                    lang=getattr(args, "lang", None),
+                    shortlist_k=getattr(args, "shortlist_k", None),
+                )
+                if result is None:
+                    raise RuntimeError("daemon returned no result")
+            except Exception as exc:
+                print(f"[laya-cli] daemon request failed ({exc}), falling back to in-process", file=sys.stderr)
+                result = None
+                # fallback: load agent if not yet loaded
+                if agent is None:
+                    agent = _init_agent(args)
+                    daemon_port = None  # don't try daemon again for remaining states? keep trying? disable for rest
+                # will fallback below
+        if result is None:
+            try:
+                if agent is None:
+                    agent = _init_agent(args)
+                if getattr(args, "shortlist_k", None) is not None:
+                    try:
+                        from laya import embed_fn_from_agent, predict_shortlist
+                    except ImportError as exc:
+                        print(f"error: shortlist requires laya shortlist module: {exc}", file=sys.stderr)
+                        sys.exit(2)
+                    embed_fn = embed_fn_from_agent(agent)
+                    k = int(args.shortlist_k)
+                    if getattr(args, "router", False):
+                        kwargs = {}
+                        if getattr(args, "lang", None):
+                            kwargs["lang"] = args.lang
+                        result = predict_shortlist(agent, state, questions, embed_fn, k=k, **kwargs)
+                    else:
+                        result = predict_shortlist(agent, state, questions, embed_fn, k=k)
                 else:
-                    result = predict_shortlist(agent, state, questions, embed_fn, k=k)
-            else:
-                if getattr(args, "router", False):
-                    kwargs = {}
-                    if getattr(args, "lang", None):
-                        kwargs["lang"] = args.lang
-                    result = agent.predict(state, questions, **kwargs)
-                else:
-                    result = agent.predict(state, questions)
-        except Exception as exc:
-            print(
-                f"[laya-cli] error: predict failed for state {str(state)[:80]!r}: {exc}",
-                file=sys.stderr,
-            )
-            result = {"error": str(exc), "state": state, "answers": {}}
+                    if getattr(args, "router", False):
+                        kwargs = {}
+                        if getattr(args, "lang", None):
+                            kwargs["lang"] = args.lang
+                        result = agent.predict(state, questions, **kwargs)
+                    else:
+                        result = agent.predict(state, questions)
+            except Exception as exc:
+                print(
+                    f"[laya-cli] error: predict failed for state {str(state)[:80]!r}: {exc}",
+                    file=sys.stderr,
+                )
+                result = {"error": str(exc), "state": state, "answers": {}}
 
         # For batch with --flatten, mimic classify output
         if is_batch and getattr(args, "flatten", False):
@@ -784,7 +888,18 @@ def cmd_predict(args: argparse.Namespace) -> None:
 def cmd_classify(args: argparse.Namespace) -> None:
     questions = _load_questions(args.questions)
     args._warmup_questions = questions
-    agent = _init_agent(args)
+    # Try daemon
+    daemon_port = None
+    agent = None
+    if not getattr(args, "no_daemon", False) and daemon_port_for_args is not None:
+        try:
+            daemon_port = daemon_port_for_args(args)  # type: ignore
+        except Exception:
+            daemon_port = None
+    if daemon_port:
+        print(f"[laya-cli] using daemon 127.0.0.1:{daemon_port}", file=sys.stderr)
+    else:
+        agent = _init_agent(args)
     n_in = n_out = 0
     for line in sys.stdin:
         line = line.strip()
@@ -811,20 +926,37 @@ def cmd_classify(args: argparse.Namespace) -> None:
                 extra_s = json.dumps(extra, ensure_ascii=False) if isinstance(extra, (dict, list)) else str(extra)
                 state_text = f"{extra_s} {state_text}"
         n_in += 1
-        try:
-            if args.router:
-                kwargs = {}
-                if args.lang:
-                    kwargs["lang"] = args.lang
-                result = agent.predict(state_text, questions, **kwargs)
-            else:
-                result = agent.predict(state_text, questions)
-        except Exception as exc:
-            print(f"[laya-cli] error: predict failed on line {n_in}: {exc}", file=sys.stderr)
-            row["_laya_error"] = str(exc)
-            sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-            continue
+        result = None
+        if daemon_port is not None and daemon_predict_via_http is not None:  # type: ignore
+            try:
+                result = daemon_predict_via_http(  # type: ignore
+                    daemon_port, state_text, questions, lang=getattr(args, "lang", None)
+                )
+                if result is None:
+                    raise RuntimeError("daemon no response")
+            except Exception as exc:
+                print(f"[laya-cli] daemon failed on line {n_in} ({exc}), falling back", file=sys.stderr)
+                result = None
+                if agent is None:
+                    agent = _init_agent(args)
+                daemon_port = None
+        if result is None:
+            try:
+                if agent is None:
+                    agent = _init_agent(args)
+                if args.router:
+                    kwargs = {}
+                    if args.lang:
+                        kwargs["lang"] = args.lang
+                    result = agent.predict(state_text, questions, **kwargs)
+                else:
+                    result = agent.predict(state_text, questions)
+            except Exception as exc:
+                print(f"[laya-cli] error: predict failed on line {n_in}: {exc}", file=sys.stderr)
+                row["_laya_error"] = str(exc)
+                sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+                continue
         answers = result.get("answers", result)
         if not isinstance(answers, dict):
             answers = {}
@@ -1087,8 +1219,19 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     fake.device = args.device
     fake.router = args.router
     fake.lang = args.lang
+    fake.no_daemon = getattr(args, "no_daemon", False)
     fake._warmup_questions = questions
-    agent = _init_agent(fake)
+    daemon_port = None
+    agent = None
+    if not getattr(args, "no_daemon", False) and daemon_port_for_args is not None:
+        try:
+            daemon_port = daemon_port_for_args(fake)  # type: ignore
+        except Exception:
+            daemon_port = None
+    if daemon_port:
+        print(f"[laya-cli] using daemon 127.0.0.1:{daemon_port}", file=sys.stderr)
+    else:
+        agent = _init_agent(fake)
     rows: list[dict[str, Any]] = []
     with open(labeled_path, encoding="utf-8") as f:
         for idx, line in enumerate(f, 1):
@@ -1128,17 +1271,32 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
             if extra is not None and str(extra).strip() != "":
                 extra_s = json.dumps(extra, ensure_ascii=False) if isinstance(extra, (dict, list)) else str(extra)
                 state_text = f"{extra_s} {state_text}"
-        try:
-            if args.router:
-                kwargs = {}
-                if args.lang:
-                    kwargs["lang"] = args.lang
-                result = agent.predict(state_text, questions, **kwargs)
-            else:
-                result = agent.predict(state_text, questions)
-        except Exception as exc:
-            print(f"[laya-cli] warning: predict failed on row: {exc}", file=sys.stderr)
-            continue
+        result = None
+        if daemon_port is not None and daemon_predict_via_http is not None:  # type: ignore
+            try:
+                result = daemon_predict_via_http(daemon_port, state_text, questions, lang=getattr(args, "lang", None))  # type: ignore
+                if result is None:
+                    raise RuntimeError("daemon no response")
+            except Exception as exc:
+                print(f"[laya-cli] daemon failed ({exc}), falling back", file=sys.stderr)
+                result = None
+                if agent is None:
+                    agent = _init_agent(fake)
+                daemon_port = None
+        if result is None:
+            try:
+                if agent is None:
+                    agent = _init_agent(fake)
+                if args.router:
+                    kwargs = {}
+                    if args.lang:
+                        kwargs["lang"] = args.lang
+                    result = agent.predict(state_text, questions, **kwargs)
+                else:
+                    result = agent.predict(state_text, questions)
+            except Exception as exc:
+                print(f"[laya-cli] warning: predict failed on row: {exc}", file=sys.stderr)
+                continue
         answers = result.get("answers", result)
         true_val = row.get(args.label_field)
         for qid, qdef in questions.items():
@@ -1260,6 +1418,247 @@ def cmd_info(args: argparse.Namespace) -> None:
         print(f"laya: not installed ({e})")
 
 
+# ---------------------------------------------------------------------------
+# Serve (resident daemon)
+# ---------------------------------------------------------------------------
+
+
+def _serve_status_for_args(args) -> tuple[bool, dict | None, Path]:
+    """Helper to get daemon status for given args config."""
+    if daemon_file_for is None:
+        return False, None, Path()
+    daemon_file = daemon_file_for(
+        getattr(args, "model", "convaiinnovations/laya"),
+        getattr(args, "subfolder", None),
+        getattr(args, "device", None),
+        bool(getattr(args, "router", False)),
+        getattr(args, "lang", None),
+    )
+    alive, status, _port = is_daemon_alive(daemon_file)  # type: ignore
+    return alive, status, daemon_file
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    action = getattr(args, "action", None)
+    if action == "status":
+        alive, status, daemon_file = _serve_status_for_args(args)
+        if alive and status:
+            print(f"Daemon running: {daemon_file}")
+            print(json.dumps(status, indent=2, ensure_ascii=False))
+            # also list all daemons if requested?
+        else:
+            # check if any daemon files exist
+            if daemon_file.exists():
+                print(f"Daemon file {daemon_file} exists but not responding (stale, removed)")
+                try:
+                    daemon_file.unlink()
+                except Exception:
+                    pass
+            print("No live daemon for this config (defaults: model=convaiinnovations/laya).")
+            print("Run `laya-cli serve --help` to start one, or `laya-cli serve status --all` to list all.")
+            # optionally list all daemons
+            if CACHE_DIR and CACHE_DIR.exists():  # type: ignore
+                files = list(CACHE_DIR.glob("*.json"))  # type: ignore
+                if files:
+                    print(f"\nOther daemon files ({len(files)}):")
+                    for f in files:
+                        alive2, st2, _ = is_daemon_alive(f)  # type: ignore
+                        state = "alive" if alive2 else "stale"
+                        try:
+                            info = json.loads(f.read_text())
+                            print(
+                                f"  {f.name}: {state} pid={info.get('pid')} port={info.get('port')} model={info.get('model')}"
+                            )
+                        except Exception:
+                            print(f"  {f.name}: {state}")
+        return
+    if action == "stop":
+        if getattr(args, "all_daemons", False):
+            if CACHE_DIR and CACHE_DIR.exists():  # type: ignore
+                files = list(CACHE_DIR.glob("*.json"))  # type: ignore
+                if not files:
+                    print("No daemon files to stop.")
+                    return
+                for f in files:
+                    alive, _status, port = is_daemon_alive(f)  # type: ignore
+                    if alive and port:
+                        from .daemon import _http_post_shutdown  # type: ignore
+
+                        ok = _http_post_shutdown(port)  # type: ignore
+                        print(f"Stopping {f.name} (port {port}) -> {'ok' if ok else 'failed, killing pid'}")
+                        if not ok:
+                            try:
+                                info = json.loads(f.read_text())
+                                os.kill(info.get("pid", 0), signal.SIGTERM)
+                            except Exception as e:
+                                print(f"  kill failed: {e}")
+                        # wait a bit and clean
+                        time.sleep(0.3)
+                        if f.exists():
+                            try:
+                                f.unlink()
+                            except Exception:
+                                pass
+                    else:
+                        print(f"Removing stale {f.name}")
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+                print("All daemons stopped.")
+            else:
+                print("No daemons running.")
+            return
+        else:
+            alive, _status, daemon_file = _serve_status_for_args(args)
+            # need port from file
+            try:
+                info = json.loads(daemon_file.read_text()) if daemon_file.exists() else {}
+                port = info.get("port")
+            except Exception:
+                port = None
+            if not alive:
+                print(f"No live daemon for this config ({daemon_file}). Nothing to stop.")
+                if daemon_file.exists():
+                    try:
+                        daemon_file.unlink()
+                        print(f"Removed stale file {daemon_file}")
+                    except Exception:
+                        pass
+                return
+            from .daemon import _http_post_shutdown  # type: ignore
+
+            ok = _http_post_shutdown(port)  # type: ignore
+            if ok:
+                print(f"Daemon on 127.0.0.1:{port} stopped via /shutdown")
+            else:
+                # fallback to SIGTERM
+                try:
+                    info = json.loads(daemon_file.read_text())
+                    os.kill(info.get("pid", 0), signal.SIGTERM)
+                    print(f"Daemon on 127.0.0.1:{port} killed via SIGTERM")
+                except Exception as e:
+                    print(f"Failed to stop daemon: {e}", file=sys.stderr)
+                    sys.exit(1)
+            # wait for file removal (daemon cleans itself)
+            for _ in range(10):
+                if not daemon_file.exists():
+                    break
+                time.sleep(0.2)
+            if daemon_file.exists():
+                try:
+                    daemon_file.unlink()
+                except Exception:
+                    pass
+            return
+
+    # Start daemon (no action)
+    # Check if already alive for this config
+    alive, status, daemon_file = _serve_status_for_args(args)
+    if alive and status:
+        print(f"Daemon already running for this config: {daemon_file}")
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+        print("Use `laya-cli serve stop` to stop it, or `laya-cli serve stop --all` for all.")
+        return
+
+    port = getattr(args, "port", 0) or 0
+    idle_timeout = getattr(args, "idle_timeout", 1800)
+    foreground = bool(getattr(args, "foreground", False))
+
+    if foreground:
+        # run in foreground (blocking)
+        if run_server is None:
+            print("error: daemon module not available", file=sys.stderr)
+            sys.exit(2)
+        daemon_file = daemon_file_for(  # type: ignore
+            getattr(args, "model", "convaiinnovations/laya"),
+            getattr(args, "subfolder", None),
+            getattr(args, "device", None),
+            bool(getattr(args, "router", False)),
+            getattr(args, "lang", None),
+        )
+        run_server(  # type: ignore
+            model=getattr(args, "model", "convaiinnovations/laya"),
+            subfolder=getattr(args, "subfolder", None),
+            device=getattr(args, "device", None),
+            router=bool(getattr(args, "router", False)),
+            lang=getattr(args, "lang", None),
+            port=port,
+            idle_timeout=idle_timeout,
+            daemon_file=daemon_file,
+        )
+        return
+    else:
+        # background: spawn child with --foreground
+        import subprocess
+
+        daemon_file = daemon_file_for(  # type: ignore
+            getattr(args, "model", "convaiinnovations/laya"),
+            getattr(args, "subfolder", None),
+            getattr(args, "device", None),
+            bool(getattr(args, "router", False)),
+            getattr(args, "lang", None),
+        )
+        # ensure cache dir exists
+        daemon_file.parent.mkdir(parents=True, exist_ok=True)
+        # Build child command
+        cmd = [
+            sys.executable,
+            "-m",
+            "laya_cli.cli",
+            "serve",
+            "--foreground",
+            "--port",
+            str(port),
+            "--idle-timeout",
+            str(idle_timeout),
+        ]
+        # forward config
+        if getattr(args, "model", None) and getattr(args, "model") != "convaiinnovations/laya":
+            cmd.extend(["--model", getattr(args, "model")])
+        if getattr(args, "subfolder", None):
+            cmd.extend(["--subfolder", getattr(args, "subfolder")])
+        if getattr(args, "device", None):
+            cmd.extend(["--device", getattr(args, "device")])
+        if getattr(args, "router", False):
+            cmd.append("--router")
+        if getattr(args, "lang", None):
+            cmd.extend(["--lang", getattr(args, "lang")])
+
+        log_file = daemon_file.with_suffix(".log")
+        print(f"[laya-cli] starting daemon in background (log: {log_file}) ...", file=sys.stderr)
+        # detach: start new session, redirect output
+        with open(log_file, "a") as log:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+                close_fds=True,
+            )
+        # wait for daemon to be ready (poll status)
+        for _ in range(30):
+            time.sleep(0.5)
+            alive, status, _ = _serve_status_for_args(args)
+            if alive and status:
+                print(
+                    f"Daemon started on 127.0.0.1:{status.get('port')} pid={status.get('pid')} (daemon file: {daemon_file})",
+                    file=sys.stderr,
+                )
+                print(json.dumps(status, indent=2, ensure_ascii=False))
+                return
+            # if child died quickly, check
+            if proc.poll() is not None:
+                print(f"Daemon process exited early with code {proc.returncode}. See log {log_file}", file=sys.stderr)
+                try:
+                    print(log_file.read_text()[-2000:], file=sys.stderr)
+                except Exception:
+                    pass
+                sys.exit(1)
+        print(f"Daemon did not become ready in 15s. Check log {log_file} and `laya-cli serve status`", file=sys.stderr)
+        sys.exit(1)
+
+
 def _preprocess_argv(argv: list[str]) -> list[str]:
     known_flags = {
         "--questions",
@@ -1292,6 +1691,11 @@ def _preprocess_argv(argv: list[str]) -> list[str]:
         "--flatten",
         "--output",
         "--q_format",
+        "--port",
+        "--idle-timeout",
+        "--foreground",
+        "--all",
+        "--no-daemon",
     }
     out: list[str] = []
     i = 0
@@ -1321,6 +1725,8 @@ def main() -> None:
         cmd_questions(args)
     elif args.cmd == "evaluate":
         cmd_evaluate(args)
+    elif args.cmd == "serve":
+        cmd_serve(args)
     elif args.cmd == "info":
         cmd_info(args)
     else:

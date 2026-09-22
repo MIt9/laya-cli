@@ -123,6 +123,35 @@ laya-cli info                                    # python/torch/cuda/mps + cache
 laya-cli evaluate --questions questions.json --labeled labeled.jsonl --label-field label --threshold 0.5
 ```
 
+### 4. Resident Daemon Mode (optional, speeds up repeated calls)
+
+Measured: `laya.load()` 10–35s (MPS) + ~120ms × 82 candidates. For one pipeline run it's fine; for iterative tuning of `questions.json` each `predict` pays 10–35s again. `serve` keeps the model in RAM — subsequent calls skip the load and hit `127.0.0.1` (<1ms overhead).
+
+```bash
+# Start daemon in background (one daemon per model/device/router config)
+laya-cli serve --model convaiinnovations/laya --device mps
+laya-cli serve --model convaiinnovations/laya --subfolder multilingual --device cpu --idle-timeout 60  # short idle for test
+laya-cli serve --router --foreground --idle-timeout 0  # foreground, no auto-exit, for logs
+
+# Check status (also shows port, pid, idle_seconds, requests_served)
+laya-cli serve status
+laya-cli serve status --model convaiinnovations/laya --subfolder multilingual
+
+# Use it — predict/classify/evaluate automatically hit the daemon if live for that config
+laya-cli predict "hello" --preset guard --format json          # -> via daemon, no 10s load
+laya-cli predict "hello" --preset guard --no-daemon --format json  # force in-process, ignore daemon
+
+# Batch also benefits (each line -> POST /predict on loopback, serialized with lock)
+cat candidates.jsonl | laya-cli classify --questions q.json | laya-cli filter --where "on_topic>=0.4" --sort -on_topic
+
+# Stop
+laya-cli serve stop                 # stop daemon for default config
+laya-cli serve stop --all           # stop all daemons
+curl http://127.0.0.1:<port>/status  # GET /status, POST /predict, POST /shutdown also work directly
+```
+
+**Details:** HTTP on `127.0.0.1` only (SKILL.md: "Bind to 127.0.0.1"), `POST /predict {"state":..., "questions":{...}}` → same as `agent.predict()`, `GET /status` → `{model, device, loaded_at, idle_seconds, requests_served}`, `POST /shutdown` (localhost only). One daemon = one checkpoint hash(`model|subfolder|device|router|lang`) → pid+port in `~/.cache/laya-cli/daemons/<hash>.json`, pid file removed on exit. Idle timeout 1800s default, `0` disables. If daemon not running, `predict`/`classify`/`evaluate` silently fall back to in-process load — no new step for scripts. `--no-daemon` forces fallback. Requests are serialized with a `threading.Lock` (one GPU = one forward pass).
+
 ---
 
 ## 🛠 Development
