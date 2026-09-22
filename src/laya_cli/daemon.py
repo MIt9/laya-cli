@@ -25,8 +25,58 @@ from typing import Any
 CACHE_DIR = Path.home() / ".cache" / "laya-cli" / "daemons"
 
 
+def _resolve_device(device: str | None) -> str:
+    """Resolve effective device: auto (cuda>mps>cpu) or explicit with fallback to cpu if unavailable."""
+    # explicit
+    if device is not None and str(device).strip() != "":
+        dev = str(device).strip().lower()
+        # normalize aliases
+        if dev in ("cuda", "cuda:0", "gpu"):
+            dev = "cuda"
+        elif dev == "mps":
+            dev = "mps"
+        elif dev == "cpu":
+            dev = "cpu"
+        # check availability, fallback to cpu
+        try:
+            import torch
+
+            if dev == "cuda" and not torch.cuda.is_available():
+                return "cpu"
+            if dev == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                return "cpu"
+        except Exception:
+            pass
+        return dev
+    # auto
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _normalize_config(
+    model: str, subfolder: str | None, device: str | None, router: bool, lang: str | None
+) -> tuple[str, str, str, str, str]:
+    """Single place for config normalization before hashing — used by both serve and client."""
+    norm_model = (model or "convaiinnovations/laya").strip()
+    norm_subfolder = (subfolder or "").strip()
+    # treat "" and None as same (bundle root)
+    norm_device = _resolve_device(device)
+    norm_router = "1" if router else "0"
+    norm_lang = (lang or "").strip().lower()
+    return (norm_model, norm_subfolder, norm_device, norm_router, norm_lang)
+
+
 def config_hash(model: str, subfolder: str | None, device: str | None, router: bool, lang: str | None) -> str:
-    raw = "|".join([model or "", subfolder or "", device or "", "1" if router else "0", lang or ""])
+    norm = _normalize_config(model, subfolder, device, router, lang)
+    raw = "|".join(norm)
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
