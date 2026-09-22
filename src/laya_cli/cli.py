@@ -53,7 +53,11 @@ except ImportError:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="laya-cli",
-        description="Ergonomic CLI for Laya — typed decisions (choice/score/noul) in one forward pass. Works for humans (table output) and agents (JSON/JSONL).",
+        description=(
+            "Ergonomic CLI for Laya — typed decisions (choice/score/noul) in one forward pass. "
+            "Works for humans (table) and agents (JSON/JSONL). "
+            "Optional resident daemon (laya-cli serve) keeps model in RAM to avoid 10-35s laya.load() on repeated predict/classify/evaluate (same model|subfolder|device|router|lang → ~/.cache/laya-cli/daemons/<hash>.json, 127.0.0.1 only, auto fallback if not running)."
+        ),
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -61,8 +65,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- predict (primary, human+AI friendly) -----------------------------
     pr = sub.add_parser(
         "predict",
-        help="Run Laya on one text/JSON state or a batch (JSONL). Human-friendly & agent-friendly.",
-        description="Predict with Laya on a single state or a batch. Supports plain text, JSON state, presets, shortlist for high-cardinality choices, and table/JSON output.",
+        help="Run Laya on one text/JSON state or a batch (JSONL). Human-friendly & agent-friendly. Auto-uses daemon if live.",
+        description=(
+            "Predict with Laya on a single state or a batch. Supports plain text, JSON state, presets, shortlist for high-cardinality choices, and table/JSON output. "
+            "If a daemon is live for the same --model/--subfolder/--device/--router/--lang (hash → ~/.cache/laya-cli/daemons/<hash>.json), predict hits 127.0.0.1:<port>/predict and skips 10-35s laya.load(); otherwise it loads in-process. Use --no-daemon to force in-process."
+        ),
         epilog=(
             "Examples (human):\n"
             '  laya-cli predict "I was charged twice, refund please" --preset triage\n'
@@ -74,6 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "  cat candidates.jsonl | laya-cli predict --questions q.json --state-field state --format jsonl > scored.jsonl\n"
             "  laya-cli predict --input candidates.jsonl --questions q.json --shortlist-k 20 --format jsonl\n"
             '  laya-cli predict --preset triage --text "my payment failed" --model convaiinnovations/laya --device cpu --full-probs\n'
+            "\n"
+            "Daemon (optional, speeds up repeated calls):\n"
+            "  laya-cli serve --model convaiinnovations/laya --device mps  # start daemon (background, writes ~/.cache/laya-cli/daemons/<hash>.json)\n"
+            "  laya-cli serve status                                        # check live daemon (GET /status)\n"
+            '  laya-cli predict "hello" --preset guard --format json      # auto-uses daemon (<1ms overhead), no 10s load\n'
+            '  laya-cli predict "hello" --preset guard --no-daemon       # force in-process, ignore daemon\n'
+            "  laya-cli serve stop                                          # graceful shutdown (POST /shutdown)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -190,14 +204,19 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- classify (legacy batch, kept for TASK.md compat) -----------------
     c = sub.add_parser(
         "classify",
-        help="Batch classify JSONL from stdin via Laya (legacy, use predict for new code).",
-        description="Classify JSONL from stdin via Laya; append flattened answers. Kept for pipeline compatibility (px | laya-cli classify). For new code prefer `predict`.",
+        help="Batch classify JSONL from stdin via Laya (legacy, use predict for new code). Auto-uses daemon if live.",
+        description=(
+            "Classify JSONL from stdin via Laya; append flattened answers. Kept for pipeline compatibility (px | laya-cli classify). "
+            "For new code prefer `predict`. If a daemon is live for the same config (hash → ~/.cache/laya-cli/daemons/<hash>.json), classify hits 127.0.0.1 and skips load; else in-process. Use --no-daemon to force."
+        ),
         epilog=(
             "Examples:\n"
             "  cat candidates.jsonl | laya-cli classify --questions questions.json > scored.jsonl\n"
             '  px videos --queries "..." --state --dedupe keep-first \\\n'
             "    | laya-cli classify --questions questions.json \\\n"
             '    | laya-cli filter --where "on_topic>=0.4" --sort -on_topic > shortlist.jsonl\n'
+            "  # with daemon (start once, then all classify hit daemon):\n"
+            "  laya-cli serve --model convaiinnovations/laya & laya-cli classify --questions q.json < candidates.jsonl\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -279,12 +298,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- evaluate ---------------------------------------------------------
     e = sub.add_parser(
         "evaluate",
-        help="Evaluate on a labelled JSONL set and print accuracy / threshold report.",
-        description="Evaluate before shipping: run classify on a labelled set and report accuracy per question, pass rate at threshold, and precision @ threshold.",
+        help="Evaluate on a labelled JSONL set and print accuracy / threshold report. Auto-uses daemon if live.",
+        description=(
+            "Evaluate before shipping: run classify on a labelled set and report accuracy per question, pass rate at threshold, and precision @ threshold. "
+            "If a daemon is live for the same --model/--device/--router, evaluate hits it and skips load; else in-process. Use --no-daemon to force."
+        ),
         epilog=(
             "Examples:\n"
             "  laya-cli evaluate --questions questions.json --labeled labeled.jsonl --label-field label --threshold 0.5\n"
             "  laya-cli evaluate --questions q.json --labeled dev.jsonl --field on_topic --state-field state\n"
+            "  laya-cli serve & laya-cli evaluate --questions q.json --labeled dev.jsonl  # via daemon\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -314,16 +337,28 @@ def _build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser(
         "serve",
         help="Resident daemon that keeps model in memory (optional, speeds up repeated predict).",
-        description="Start a resident daemon that holds the Laya model in RAM. Subsequent predict/classify/evaluate automatically use it if live (same model/device/router). No change to pipelines if daemon not running.",
+        description=(
+            "Start a resident daemon that holds the Laya model in RAM (10-35s laya.load() once). "
+            "Subsequent `predict`/`classify`/`evaluate` with the SAME config (--model/--subfolder/--device/--router/--lang → hash → ~/.cache/laya-cli/daemons/<hash>.json) "
+            "automatically hit 127.0.0.1:<port>/predict and skip the load (<1ms overhead). If no daemon, they fall back to in-process load — no pipeline change. "
+            "Daemon binds only 127.0.0.1 (SKILL.md: Bind to 127.0.0.1), single-threaded lock (one GPU = one forward pass), idle-timeout auto-exit (default 1800s, 0=disabled), warmup throwaway predict on start."
+        ),
         epilog=(
-            "Examples:\n"
-            "  laya-cli serve --model convaiinnovations/laya --device mps  # start daemon (background)\n"
-            "  laya-cli serve --foreground --idle-timeout 60                # foreground, for debugging\n"
-            "  laya-cli serve status                                        # show live daemon\n"
-            "  laya-cli serve status --model convaiinnovations/laya --subfolder multilingual\n"
-            "  laya-cli serve stop                                          # graceful shutdown\n"
-            "  laya-cli serve stop --all                                    # stop all daemons\n"
-            '  laya-cli predict "hello" --preset guard --no-daemon       # force in-process, ignore daemon\n'
+            "Workflow for AI/human (typical tuning loop):\n"
+            "  laya-cli serve --model convaiinnovations/laya --device mps         # start once (background, writes ~/.cache/laya-cli/daemons/<hash>.json)\n"
+            "  laya-cli serve status                                              # GET /status → {model,device,loaded_at,idle_seconds,requests_served,pid,port}\n"
+            '  laya-cli predict "test" --preset triage --format json             # auto via daemon (no 10s load)\n'
+            '  laya-cli predict "test2" --preset triage --format json            # still via daemon\n'
+            '  laya-cli predict "test" --preset triage --no-daemon --format json # force in-process (ignore daemon)\n'
+            "  cat candidates.jsonl | laya-cli classify --questions q.json        # batch: each line POST /predict (serialized)\n"
+            "  laya-cli serve stop                                                # POST /shutdown or SIGTERM, removes pid file\n"
+            "  laya-cli serve stop --all                                          # stop all configs\n"
+            "\n"
+            "Other examples:\n"
+            "  laya-cli serve --foreground --idle-timeout 5 --port 0              # foreground for logs, 5s idle test\n"
+            "  laya-cli serve --model convaiinnovations/laya --subfolder multilingual --device cpu\n"
+            "  laya-cli serve status --model convaiinnovations/laya --subfolder multilingual  # check that config\n"
+            '  curl http://127.0.0.1:<port>/status ; curl -X POST http://127.0.0.1:<port>/predict -d \'{"state":"hi","questions":{...}}\'\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

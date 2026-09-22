@@ -16,6 +16,7 @@ A modern, high-performance CLI for [Laya](https://github.com/NandhaKishorM/laya)
 * 🔍 **Preset Library**: `triage` / `email` / `guard` / `moderation` / `router` — direct `laya.*_questions()` passthrough, mergeable with `--questions file.json` and `--questions-inline`
 * 📦 **Streaming Batch Mode**: `classify`/`predict --input` loads model **once** + warmup, streams JSONL (`--state-field` verbatim, no silent `(photographer: Name)` injection)
 * 🔧 **Post-Filter & Eval**: `filter --where "on_topic>=0.4" --sort -on_topic` and `evaluate` (accuracy, passing @ threshold, precision, escalation rate)
+* ⚡ **Resident Daemon (optional)**: `laya-cli serve` keeps model in RAM — `predict`/`classify`/`evaluate` auto-hit `127.0.0.1` and skip 10-35s `laya.load()` on repeated calls (hash → `~/.cache/laya-cli/daemons/<hash>.json`, idle-timeout 1800s)
 
 ---
 
@@ -125,32 +126,68 @@ laya-cli evaluate --questions questions.json --labeled labeled.jsonl --label-fie
 
 ### 4. Resident Daemon Mode (optional, speeds up repeated calls)
 
-Measured: `laya.load()` 10–35s (MPS) + ~120ms × 82 candidates. For one pipeline run it's fine; for iterative tuning of `questions.json` each `predict` pays 10–35s again. `serve` keeps the model in RAM — subsequent calls skip the load and hit `127.0.0.1` (<1ms overhead).
+**Виміряний факт (сесія 2026-09-22, 82 кандидати, MPS):**
+
+| етап | час |
+|------|-----|
+| `px` (мережа, 12 запитів) | 9.3s |
+| `laya.load()` (модель у пам'ять) | 10–35s |
+| inference, 82 кандидати | ~10s (~120ms/шт) |
+| `filter` | 0.08s |
+
+Для одного пайплайну `px → classify → filter` 35–50s норм. Проблема — коли за сесію кілька разів викликаєш `predict`/`classify`/`evaluate` (підбір `questions.json`: прогнав → подивився → поправив → знову), кожен раз платиш 10–35s за ту саму модель. `laya-cli serve` тримає модель в RAM, наступні виклики летять на `127.0.0.1` (<1ms overhead).
+
+#### Транспорт (як у `~/.claude/skills/laya-integration/SKILL.md` "Anything else... HTTP sidecar")
+
+HTTP на loopback `127.0.0.1` (не `0.0.0.0`), один потік з `threading.Lock` (SKILL.md: "one GPU serves one forward pass at a time"):
+
+- `POST /predict` → `{"state": ..., "questions": {...}, "lang": "...", "shortlist_k": 20}` → те саме що `agent.predict()` (той самий JSON що `laya-cli predict --format json`)
+- `GET /status` → `{"model": "...", "subfolder": "...", "device": "...", "loaded_at": 123..., "idle_seconds": 42, "requests_served": 17, "pid": 12345, "port": 8765}`
+- `POST /shutdown` → graceful stop (лише з localhost, також `serve stop` шле сигнал за pid-файлом)
+
+#### Lifecycle
 
 ```bash
-# Start daemon in background (one daemon per model/device/router config)
+# Старт (без --foreground — форк у фон, пише pid+port в ~/.cache/laya-cli/daemons/<hash>.json)
 laya-cli serve --model convaiinnovations/laya --device mps
-laya-cli serve --model convaiinnovations/laya --subfolder multilingual --device cpu --idle-timeout 60  # short idle for test
-laya-cli serve --router --foreground --idle-timeout 0  # foreground, no auto-exit, for logs
+laya-cli serve --model convaiinnovations/laya --subfolder multilingual --device cpu --idle-timeout 60
+laya-cli serve --router --foreground --idle-timeout 0 --port 8765  # форграунд для логів, 0=disabled idle
 
-# Check status (also shows port, pid, idle_seconds, requests_served)
-laya-cli serve status
-laya-cli serve status --model convaiinnovations/laya --subfolder multilingual
-
-# Use it — predict/classify/evaluate automatically hit the daemon if live for that config
-laya-cli predict "hello" --preset guard --format json          # -> via daemon, no 10s load
-laya-cli predict "hello" --preset guard --no-daemon --format json  # force in-process, ignore daemon
-
-# Batch also benefits (each line -> POST /predict on loopback, serialized with lock)
-cat candidates.jsonl | laya-cli classify --questions q.json | laya-cli filter --where "on_topic>=0.4" --sort -on_topic
-
-# Stop
-laya-cli serve stop                 # stop daemon for default config
-laya-cli serve stop --all           # stop all daemons
-curl http://127.0.0.1:<port>/status  # GET /status, POST /predict, POST /shutdown also work directly
+# Один daemon = один конфіг (hash(model|subfolder|device|router|lang)), інший конфіг — окремий файл/порт
+laya-cli serve status                                          # дефолтний конфіг (як у predict без прапорців)
+laya-cli serve status --model convaiinnovations/laya --subfolder multilingual --device cpu
+laya-cli serve stop                                            # graceful (POST /shutdown → pid файл видаляється)
+laya-cli serve stop --all                                      # всі daemon-и
+# Також: curl http://127.0.0.1:<port>/status
 ```
 
-**Details:** HTTP on `127.0.0.1` only (SKILL.md: "Bind to 127.0.0.1"), `POST /predict {"state":..., "questions":{...}}` → same as `agent.predict()`, `GET /status` → `{model, device, loaded_at, idle_seconds, requests_served}`, `POST /shutdown` (localhost only). One daemon = one checkpoint hash(`model|subfolder|device|router|lang`) → pid+port in `~/.cache/laya-cli/daemons/<hash>.json`, pid file removed on exit. Idle timeout 1800s default, `0` disables. If daemon not running, `predict`/`classify`/`evaluate` silently fall back to in-process load — no new step for scripts. `--no-daemon` forces fallback. Requests are serialized with a `threading.Lock` (one GPU = one forward pass).
+Перед прийомом запитів — прогрів throwaway `predict` (як у `TASK.md`). `idle-timeout 1800s` дефолт, `--idle-timeout 5` для тесту → daemon сам виходить через 5s без запитів і `serve status` каже `not running`.
+
+#### Клієнт (`predict`/`classify`/`evaluate`)
+
+Перед `laya.load()` перевіряє `~/.cache/laya-cli/daemons/<hash>.json` для поточного конфігу; якщо файл є і daemon відповідає на `/status` — шле туди, інакше мовчки падає назад на in-process (поведінка `v1` без змін). `--no-daemon` форсує in-process (для відтворюваності/дебагу). Для батчу (`classify`/`predict --input`) — кожен рядок окремий `POST /predict` в циклі (loopback мілісекунди, batch-ендпоінт не потрібен).
+
+```bash
+# AI workflow (повністю автоматичний):
+laya-cli serve --device mps &                          # один раз на сесію
+laya-cli predict "hello" --preset guard --format json  # -> via daemon, без 10s
+laya-cli predict "hello2" --preset guard --format json # -> знову via daemon
+laya-cli serve status                                  # {"loaded_at":..., "requests_served": 2}
+laya-cli predict "hello" --preset guard --no-daemon    # форс in-process (знову 10s, для ізоляції)
+laya-cli serve stop
+
+# Human tuning loop (типовий):
+laya-cli serve &                                       # фон
+cat candidates.jsonl | laya-cli classify --questions q.json | laya-cli filter --where "on_topic>=0.4" --sort -on_topic  # via daemon
+# ...поправив q.json...
+cat candidates.jsonl | laya-cli classify --questions q.json | laya-cli filter ...  # знову via daemon, без перезавантаження
+laya-cli serve stop
+
+# 5 паралельних predict — не падають, результати не плутаються (серіалізація Lock)
+seq 1 5 | xargs -P5 -I{} laya-cli predict "text {}" --preset guard --format json
+```
+
+**Безпека/межі:** лише `127.0.0.1`, без auth (однокористувацька машина, як у SKILL.md), один потік, stateless крім моделі.
 
 ---
 
