@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install (no heavy ML deps for mocked tests)
+        run: |
+          uv sync --group test
+          # For mocked tests we don't need the real torch/laya weights;
+          # uv sync already installed deps, but tests mock laya.
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Tests (mocked, no model download)
+        run: uv run pytest --cov --cov-report=term-missing
+
+  test-real-model:
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.message, '[real-model]')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync
+      - run: uv run pytest -m slow --cov --cov-report=term-missing

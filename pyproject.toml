@@ -1,0 +1,105 @@
+[project]
+name = "laya-cli"
+version = "0.1.0"
+description = "Ergonomic CLI for Laya — typed decisions for humans and AI agents (predict, batch, presets, shortlist, router)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "MIt9"}]
+keywords = ["laya", "decision-model", "cli", "router", "guardrails", "triage", "ai"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "laya>=0.3.4",
+  "huggingface_hub>=0.20.0",
+  "numpy>=1.20.0",
+  # laya pulls torch/transformers/safetensors transitively, but keep explicit for uv resolver
+  "torch>=2.0.0",
+  "transformers>=4.48.0",
+  "safetensors>=0.4.0",
+]
+
+[project.scripts]
+laya-cli = "laya_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/MIt9/laya-cli"
+Repository = "https://github.com/MIt9/laya-cli.git"
+Issues = "https://github.com/MIt9/laya-cli/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.9",
+  "mypy>=1.10",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.9",
+  "mypy>=1.10",
+  "types-requests",
+]
+test = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/laya_cli"]
+
+[tool.hatch.version]
+path = "src/laya_cli/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "slow: marks tests as slow (need real model download)",
+]
+
+[tool.coverage.run]
+source = ["src/laya_cli"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+# B, C4, UP are style/nitpicks — enable gradually; keep CI green
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.uv]
+managed = true
