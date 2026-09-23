@@ -45,3 +45,6 @@ models/
 .env
 *.log
 tmp/
+
+# tasks (local only, not committed)
+TASK*.md

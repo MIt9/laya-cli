@@ -591,32 +591,45 @@ def _collect_states_predict(args) -> list[tuple[Any, Any]]:
                     row = {"state": line}
                 if not isinstance(row, dict):
                     row = {"state": str(row)}
+                # If requested state-field is missing, fall back to using the whole row as state (dict)
+                # This matches `laya-cli predict --state '{"posting":"..."}'` which sends the dict.
+                # Without this, batch with `{"posting":"..."}` and default --state-field state would send "" for every row.
+                if args.state_field not in row:
+                    # Only warn when using default field and row has other keys
+                    if args.state_field == "state":
+                        print(
+                            f"[laya-cli] warning: field 'state' not in row {list(row.keys())}, using entire row as state. Use --state-field to specify.",
+                            file=sys.stderr,
+                        )
+                    state: Any = row
+                    states.append((row, state))
+                    continue
                 raw = row.get(args.state_field, "")
                 if raw is None:
                     raw = ""
                 if isinstance(raw, (dict, list)):
                     state_text = json.dumps(raw, ensure_ascii=False)
+                    state: Any = raw  # keep dict/list for Laya (it serializes), but also keep string for backwards compat
+                    # For Laya, passing the raw dict/list is better than json string; use raw
+                    state = raw
                 else:
                     state_text = str(raw)
+                    state = state_text
                 if getattr(args, "prepend_field", None):
                     extra = row.get(args.prepend_field)
                     if extra is not None and str(extra).strip() != "":
                         extra_s = (
                             json.dumps(extra, ensure_ascii=False) if isinstance(extra, (dict, list)) else str(extra)
                         )
+                        # Need state_text for prepend, so ensure we have it
+                        if not isinstance(raw, (dict, list)):
+                            state_text = str(raw)
+                        else:
+                            state_text = json.dumps(raw, ensure_ascii=False)
                         state_text = f"{extra_s} {state_text}"
+                        state = state_text
                 # keep original row for output
-                states.append(
-                    (
-                        row,
-                        state_text
-                        if not isinstance(row.get(args.state_field), (dict, list)) or isinstance(raw, (dict, list))
-                        else state_text,
-                    )
-                )
-                # For cases where state field was dict/list originally, state_text already serialized
-                # but we remember original row
-                states[-1] = (row, state_text)
+                states.append((row, state))
         finally:
             if fh is not sys.stdin:
                 fh.close()
@@ -686,9 +699,27 @@ def _collect_states_predict(args) -> list[tuple[Any, Any]]:
                 row = json.loads(line)
                 if isinstance(row, dict):
                     has_json = True
-                    raw = row.get(args.state_field, "")
-                    st = json.dumps(raw, ensure_ascii=False) if isinstance(raw, (dict, list)) else str(raw)
-                    states.append((row, st))
+                    if args.state_field in row:
+                        raw = row.get(args.state_field, "")
+                        if isinstance(raw, (dict, list)):
+                            st: Any = raw
+                        else:
+                            st = str(raw)
+                            # handle prepend for stdin batch as well
+                            if getattr(args, "prepend_field", None):
+                                extra = row.get(args.prepend_field)
+                                if extra is not None and str(extra).strip() != "":
+                                    extra_s = json.dumps(extra, ensure_ascii=False) if isinstance(extra, (dict, list)) else str(extra)
+                                    st = f"{extra_s} {st}"
+                        states.append((row, st))
+                    else:
+                        # state field missing -> use whole row as state (dict), like --state '{"posting":...}'
+                        if args.state_field == "state":
+                            print(
+                                f"[laya-cli] warning: field 'state' not in row {list(row.keys())}, using entire row as state",
+                                file=sys.stderr,
+                            )
+                        states.append((row, row))
                 else:
                     states.append((None, str(row)))
             except json.JSONDecodeError:
