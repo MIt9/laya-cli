@@ -609,7 +609,9 @@ def _collect_states_predict(args) -> list[tuple[Any, Any]]:
                     raw = ""
                 if isinstance(raw, (dict, list)):
                     state_text = json.dumps(raw, ensure_ascii=False)
-                    state: Any = raw  # keep dict/list for Laya (it serializes), but also keep string for backwards compat
+                    state: Any = (
+                        raw  # keep dict/list for Laya (it serializes), but also keep string for backwards compat
+                    )
                     # For Laya, passing the raw dict/list is better than json string; use raw
                     state = raw
                 else:
@@ -709,7 +711,11 @@ def _collect_states_predict(args) -> list[tuple[Any, Any]]:
                             if getattr(args, "prepend_field", None):
                                 extra = row.get(args.prepend_field)
                                 if extra is not None and str(extra).strip() != "":
-                                    extra_s = json.dumps(extra, ensure_ascii=False) if isinstance(extra, (dict, list)) else str(extra)
+                                    extra_s = (
+                                        json.dumps(extra, ensure_ascii=False)
+                                        if isinstance(extra, (dict, list))
+                                        else str(extra)
+                                    )
                                     st = f"{extra_s} {st}"
                         states.append((row, st))
                     else:
