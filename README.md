@@ -1,5 +1,7 @@
 # ✨ Laya CLI (`laya-cli`)
 
+> **Typed decisions in 33ms — no generation, no hallucination** — CLI for Laya (`choice`/`score`/`noul`) for Humans & AI Agents. One model load, streaming batch mode.
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Built with uv](https://img.shields.io/badge/built%20with-uv-purple.svg)](https://github.com/astral-sh/uv)
